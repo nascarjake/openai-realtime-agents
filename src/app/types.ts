@@ -144,3 +144,9 @@ export const GuardrailOutputZod = z.object({
 });
 
 export type GuardrailOutput = z.infer<typeof GuardrailOutputZod>;
+
+export interface Model {
+  id: string;
+  name: string;
+  description: string;
+}

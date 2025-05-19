@@ -11,9 +11,10 @@ import Transcript from "./components/Transcript";
 import Events from "./components/Events";
 import BottomToolbar from "./components/BottomToolbar";
 import AnimatedBubble from "./components/AnimatedBubble";
+import ModelSelector from "./components/ModelSelector";
 
 // Types
-import { AgentConfig, SessionStatus } from "@/app/types";
+import { AgentConfig, SessionStatus, Model } from "@/app/types";
 
 // Context providers & hooks
 import { useTranscript } from "@/app/contexts/TranscriptContext";
@@ -28,6 +29,10 @@ import { createRealtimeConnection } from "./lib/realtimeConnection";
 import { allAgentSets, defaultAgentSetKey } from "@/app/agentConfigs";
 
 import useAudioDownload from "./hooks/useAudioDownload";
+import useAudioAnalyzer from "./hooks/useAudioAnalyzer";
+
+// Default mini model to use when there's no saved preference
+const DEFAULT_MINI_MODEL = "gpt-4o-realtime-preview-mini";
 
 function App() {
   const { mode, toggleMode } = useUIMode();
@@ -35,6 +40,52 @@ function App() {
 
   // Use urlCodec directly from URL search params (default: "opus")
   const urlCodec = searchParams.get("codec") || "opus";
+  
+  // Load model from localStorage or URL, with mini model as ultimate fallback
+  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [availableModels, setAvailableModels] = useState<Model[]>([]);
+
+  // Fetch available models and set the initial model
+  useEffect(() => {
+    const fetchModels = async () => {
+      try {
+        const response = await fetch("/api/models");
+        if (!response.ok) {
+          throw new Error("Failed to fetch models");
+        }
+        const data = await response.json();
+        setAvailableModels(data.models);
+        
+        // Now that we have models, determine which one to use
+        const modelFromUrl = searchParams.get("model");
+        const modelFromStorage = localStorage.getItem("selectedModel");
+        
+        // Priority: URL param > localStorage > mini model > first available model
+        if (modelFromUrl) {
+          setSelectedModel(modelFromUrl);
+        } else if (modelFromStorage) {
+          setSelectedModel(modelFromStorage);
+        } else {
+          // Find a mini model or use the first available model
+          const miniModel = data.models.find((model: Model) => model.id.includes("mini"));
+          setSelectedModel(miniModel ? miniModel.id : (data.models[0]?.id || DEFAULT_MINI_MODEL));
+        }
+      } catch (err) {
+        console.error("Error fetching models:", err);
+        // If we can't fetch models, use the default mini model
+        setSelectedModel(DEFAULT_MINI_MODEL);
+      }
+    };
+
+    fetchModels();
+  }, [searchParams]);
+
+  // Save selected model to localStorage when it changes
+  useEffect(() => {
+    if (selectedModel) {
+      localStorage.setItem("selectedModel", selectedModel);
+    }
+  }, [selectedModel]);
 
   const { transcriptItems, addTranscriptMessage, addTranscriptBreadcrumb } =
     useTranscript();
@@ -70,6 +121,12 @@ function App() {
   // State for simple mode
   const [isAssistantSpeaking, setIsAssistantSpeaking] = useState<boolean>(false);
 
+  // Add a new state to track if user manually disconnected
+  const [userDisconnected, setUserDisconnected] = useState<boolean>(false);
+
+  // Get audio volume for animation
+  const audioVolume = useAudioAnalyzer(audioElementRef.current);
+
   const sendClientEvent = (eventObj: any, eventNameSuffix = "") => {
     if (dcRef.current && dcRef.current.readyState === "open") {
       logClientEvent(eventObj, eventNameSuffix);
@@ -95,13 +152,12 @@ function App() {
     setIsOutputAudioBufferActive: (isActive) => {
       setIsOutputAudioBufferActive(isActive);
       
-      // Also update the simple mode state
+      // Also update the simple mode state without a timeout
+      // so it stays active for the entire audio playback
       setIsAssistantSpeaking(isActive);
       
-      // Set a timeout to reset it for simple mode when output likely finishes
-      if (isActive) {
-        setTimeout(() => setIsAssistantSpeaking(false), 500);
-      }
+      // Debug log to track animation state changes
+      console.log(`AI speaking state changed: ${isActive ? 'STARTED' : 'STOPPED'}`);
     },
   });
 
@@ -152,8 +208,8 @@ function App() {
   }, [isPTTActive]);
 
   const fetchEphemeralKey = async (): Promise<string | null> => {
-    logClientEvent({ url: "/session" }, "fetch_session_token_request");
-    const tokenResponse = await fetch("/api/session");
+    logClientEvent({ url: "/session", model: selectedModel }, "fetch_session_token_request");
+    const tokenResponse = await fetch(`/api/session?model=${encodeURIComponent(selectedModel)}`);
     const data = await tokenResponse.json();
     logServerEvent(data, "fetch_session_token_response");
 
@@ -170,6 +226,9 @@ function App() {
   const connectToRealtime = async () => {
     if (sessionStatus !== "DISCONNECTED") return;
     setSessionStatus("CONNECTING");
+    
+    // Reset the user disconnected flag
+    setUserDisconnected(false);
 
     try {
       const EPHEMERAL_KEY = await fetchEphemeralKey();
@@ -224,6 +283,9 @@ function App() {
     setDataChannel(null);
     setSessionStatus("DISCONNECTED");
     setIsPTTUserSpeaking(false);
+    
+    // Set flag to indicate user manually disconnected
+    setUserDisconnected(true);
 
     logClientEvent({}, "disconnected");
   };
@@ -364,7 +426,6 @@ function App() {
   const onToggleConnection = () => {
     if (sessionStatus === "CONNECTED" || sessionStatus === "CONNECTING") {
       disconnectFromRealtime();
-      setSessionStatus("DISCONNECTED");
     } else {
       connectToRealtime();
     }
@@ -390,6 +451,25 @@ function App() {
     url.searchParams.set("codec", newCodec);
     window.location.replace(url.toString());
   };
+
+  const handleModelChange = (newModel: string) => {
+    setSelectedModel(newModel);
+    
+    // Reconnect with the new model if already connected
+    if (sessionStatus === "CONNECTED" || sessionStatus === "CONNECTING") {
+      disconnectFromRealtime();
+      setTimeout(() => {
+        connectToRealtime();
+      }, 500);
+    }
+  };
+
+  // Update the effect that handles automatic connection to respect user's disconnect choice
+  useEffect(() => {
+    if (selectedModel && selectedAgentName && sessionStatus === "DISCONNECTED" && !userDisconnected) {
+      connectToRealtime();
+    }
+  }, [selectedModel, selectedAgentName, sessionStatus, userDisconnected]);
 
   useEffect(() => {
     const storedPushToTalkUI = localStorage.getItem("pushToTalkUI");
@@ -494,7 +574,11 @@ function App() {
             </div>
           </div>
           <div className="flex items-center">
-            <label className="flex items-center text-base gap-1 mr-2 font-medium">
+            <ModelSelector 
+              selectedModel={selectedModel} 
+              onModelChange={handleModelChange} 
+            />
+            <label className="flex items-center text-base gap-1 mr-2 ml-6 font-medium">
               Scenario
             </label>
             <div className="relative inline-block">
@@ -639,6 +723,7 @@ function App() {
             <AnimatedBubble 
               isUserSpeaking={isPTTUserSpeaking} 
               isAIResponding={isAssistantSpeaking}
+              audioVolume={audioVolume}
             />
           </div>
   
@@ -790,7 +875,7 @@ function App() {
   
         {/* Agent name indicator */}
         <div className="absolute bottom-5 text-center w-full text-gray-400">
-          Agent: {selectedAgentName}
+          Agent: {selectedAgentName} | Model: {selectedModel}
         </div>
       </div>
     );
